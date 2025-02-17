@@ -54,13 +54,42 @@ macro_rules! txn_validation_error {
 
 // Takes a validated block and updates the account set
 fn push_block(block: &Block, account_set: &mut Accounts) {
-    // For each txn, create necessary account numbers, then transfer those numbers
+    for txn in block.txns.iter() {
+        let total_spend = txn_total_spend(txn);
+
+        account_set
+            .entry(txn.sender)
+            .and_modify(|a| *a -= total_spend);
+
+        for reciever in txn.recievers.iter() {
+            account_set
+                .entry(reciever.0)
+                .and_modify(|a| *a += reciever.1)
+                .or_insert(reciever.1);
+        }
+    }
 }
 
 // Takes the most recently applied block and undoes its transactions
 fn pop_block(block: &Block, account_set: &mut Accounts) {
-    // For each txn, perform each txn in reverse and then delete all 0 accounts
-    todo!()
+    for txn in block.txns.iter() {
+        let total_spend = txn_total_spend(txn);
+
+        account_set
+            .entry(txn.sender)
+            .and_modify(|a| *a += total_spend);
+
+        for reciever in txn.recievers.iter() {
+            // if the reciever has a balance equal to as much as they were sent in this txn, their balance will be 0 after. Remove from the account set.
+            if account_set[&reciever.0] == reciever.1 {
+                account_set.remove(&reciever.0);
+            } else {
+                account_set
+                    .entry(reciever.0)
+                    .and_modify(|a| *a -= reciever.1);
+            }
+        }
+    }
 }
 
 // Takes a block and ensures that it meets all required rules
@@ -162,7 +191,7 @@ pub fn check_txn(txn: &Txn, account_set: &Accounts) -> Result<(), Error> {
         .verify_schnorr(&sig, &encode_txn(&txn), &key)
         .map_err(|e| Error::TxnValidationError(e.to_string()))?;
 
-    *account_set
+    account_set
         .get(&txn.sender)
         .ok_or(Error::TxnValidationError(
             "The sender's pk isn't in the account set".into(),
@@ -236,6 +265,7 @@ pub fn encode_txn(txn: &Txn) -> Vec<u8> {
     let mut data = vec![];
 
     data.extend(txn.sender.iter());
+    data.push(txn.recievers.len() as u8);
 
     for reciever in txn.recievers.iter() {
         data.extend(reciever.0.iter());
