@@ -179,7 +179,13 @@ pub fn check_txn(txn: &Txn, account_set: &Accounts) -> Result<(), Error> {
 }
 
 pub fn block_size(block: &Block) -> usize {
-    HEADER_SIZE + TXN_SIZE * block.txns.len()
+    let mut size = size_of::<Header>();
+
+    for txn in block.txns.iter() {
+        size += encode_txn(&txn).len();
+    }
+
+    return size;
 }
 
 pub fn calc_coinbase(block_size: usize, median_block_size: usize) -> u64 {
@@ -226,14 +232,18 @@ pub fn txn_hash(txn: &Txn) -> [u8; 32] {
     hash(&encode_txn(txn))
 }
 
-pub fn encode_txn(txn: &Txn) -> [u8; TXN_SIZE] {
-    let mut data = [0_u8; 144];
+pub fn encode_txn(txn: &Txn) -> Vec<u8> {
+    let mut data = vec![];
 
-    data[0..32].copy_from_slice(&txn.sender);
-    data[32..64].copy_from_slice(&txn.reciever);
-    data[64..128].copy_from_slice(&txn.signature);
-    data[128..136].copy_from_slice(&txn.amount.to_le_bytes());
-    data[136..=144].copy_from_slice(&txn.fee.to_le_bytes());
+    data.extend(txn.sender.iter());
+
+    for reciever in txn.recievers.iter() {
+        data.extend(reciever.0.iter());
+        data.extend(reciever.1.to_le_bytes().iter());
+    }
+
+    data.extend(txn.signature.iter());
+    data.extend(txn.fee.to_le_bytes().iter());
 
     data
 }
