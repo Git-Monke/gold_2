@@ -10,9 +10,8 @@ struct Block {
 
 struct Txn {
     sender: [u8; 32],
-    reciever: [u8; 32],
+    recievers: Vec<([u8; 32], u64)>,
     signature: [u8; 64],
-    amount: u64,
     fee: u64,
 }
 
@@ -34,7 +33,7 @@ struct BlockchainState<'a> {
 type Accounts = std::collections::HashMap<[u8; 32], u64>;
 
 const HEADER_SIZE: usize = 80;
-const TXN_SIZE: usize = 144;
+const FEES_PER_BYTE: u64 = 2_000_000;
 
 pub enum Error {
     BlockValidationError(String),
@@ -120,26 +119,37 @@ pub fn check_txns(txn_list: &Vec<Txn>, account_set: &Accounts, coinbase: u64) ->
         // check_txn verifies the account is in the set, so this will always unwrap properly
         let balance = account_set.get(&txn.sender).copied().unwrap();
         let current_spend = total_spend.get(&txn.sender).copied().unwrap_or(0);
+        let spend = txn_total_spend(&txn);
 
-        if (txn.amount + txn.fee + current_spend) > balance {
+        if (spend + current_spend) > balance {
             txn_validation_error!("Sender tried to spend more than their balance");
         }
 
-        total_spend
-            .entry(txn.sender)
-            .and_modify(|a| *a += txn.amount + txn.fee);
+        total_spend.entry(txn.sender).and_modify(|a| *a += spend);
 
         fees += txn.fee;
     }
 
-    if txn_list[0].amount > coinbase + fees {
+    if txn_list[0].recievers.len() > 1 {
+        txn_validation_error!("Coinbase txn had more than 1 reciever")
+    }
+
+    if txn_list[0].recievers[0].1 > coinbase + fees {
         txn_validation_error!("Coinbase transaction produces more currency than allowed")
     }
 
     Ok(())
 }
 
-// checks the data is valid, but doesn't check if the amount they're trying to spend is valid
+pub fn txn_total_spend(txn: &Txn) -> u64 {
+    let mut sum = 0;
+    for output in txn.recievers.iter() {
+        sum += output.1;
+    }
+    sum + txn.fee
+}
+
+// checks the data is valid, the fee matches the txn size, but doesn't check if the amount they're trying to spend is valid
 pub fn check_txn(txn: &Txn, account_set: &Accounts) -> Result<(), Error> {
     let key = XOnlyPublicKey::from_byte_array(&txn.sender).map_err(|_| {
         Error::TxnValidationError("The sender's public key isn't a point on the curve".into())
@@ -157,6 +167,13 @@ pub fn check_txn(txn: &Txn, account_set: &Accounts) -> Result<(), Error> {
         .ok_or(Error::TxnValidationError(
             "The sender's pk isn't in the account set".into(),
         ))?;
+
+    let size = encode_txn(txn).len() as u64;
+    let min_fee = FEES_PER_BYTE * size;
+
+    if txn.fee < min_fee {
+        txn_validation_error!("Txn doesn't pay enough in fees");
+    }
 
     Ok(())
 }
