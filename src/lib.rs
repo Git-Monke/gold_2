@@ -44,7 +44,14 @@ pub struct BlockchainState {
 pub struct UndoBlock {
     removed_time: u64,
     removed_block_size: usize,
-    previous_block: Block,
+    txns: Vec<Txn>,
+    name_changes: Vec<RenameOpUndo>,
+}
+
+pub struct RenameOpUndo {
+    old_pk: Option<[u8; 32]>,
+    name: String,
+    fee: u64,
 }
 
 pub type Accounts = HashMap<[u8; 32], u64>;
@@ -75,6 +82,8 @@ macro_rules! txn_validation_error {
 fn push_block(block: Block, blockchain_state: &mut BlockchainState) -> UndoBlock {
     let account_set = &mut blockchain_state.account_set;
     let name_set = &mut blockchain_state.name_set;
+    // stores all the name change operation undos.
+    let mut name_undos = vec![];
 
     // Execute transactions
     for txn in block.txns.iter() {
@@ -94,6 +103,12 @@ fn push_block(block: Block, blockchain_state: &mut BlockchainState) -> UndoBlock
 
     // Execute name changes
     for op in block.name_changes.iter() {
+        name_undos.push(RenameOpUndo {
+            old_pk: name_set.get(&op.new_name.clone()).map(|v| *v),
+            name: op.new_name.clone(),
+            fee: op.fee,
+        });
+
         name_set.insert(op.new_name.clone(), op.pk);
 
         if account_set[&op.pk] == op.fee {
@@ -113,7 +128,8 @@ fn push_block(block: Block, blockchain_state: &mut BlockchainState) -> UndoBlock
     UndoBlock {
         removed_time,
         removed_block_size,
-        previous_block: block,
+        txns: block.txns,
+        name_changes: name_undos,
     }
 }
 
@@ -131,8 +147,10 @@ pub fn push_to_front<T: Copy + Default>(arr: &mut [T], item: T) -> T {
 }
 
 // Takes the most recently applied block and undoes its transactions
-fn pop_block(block: &Block, account_set: &mut Accounts) {
-    for txn in block.txns.iter() {
+fn pop_block(undo_block: &UndoBlock, blockchain_state: &mut BlockchainState) {
+    let account_set = &mut blockchain_state.account_set;
+
+    for txn in undo_block.txns.iter() {
         let total_spend = txn_total_spend(txn);
 
         account_set
@@ -148,6 +166,14 @@ fn pop_block(block: &Block, account_set: &mut Accounts) {
                     .entry(reciever.0)
                     .and_modify(|a| *a -= reciever.1);
             }
+        }
+    }
+
+    let name_set = &mut blockchain_state.name_set;
+
+    for name_change in undo_block.name_changes.iter() {
+        if name_change.old_pk.is_some() {
+            name_set.insert(name_change.name.clone(), name_change.old_pk.unwrap());
         }
     }
 }
@@ -180,19 +206,27 @@ fn validate_block(block: &Block, blockchain_state: &BlockchainState) -> Result<(
 
     // validate other qualities
 
-    if block_size(&block) > 2 * blockchain_state.median_block_size {
+    let median_block_size = median_block_size(&blockchain_state.last_100_block_sizes);
+
+    if block_size(&block) > 2 * median_block_size {
         block_validation_error!("Block is bigger than twice the median block size")
     }
 
     check_txns(
         &block.txns,
-        blockchain_state.account_set,
-        calc_coinbase(block_size(&block), blockchain_state.median_block_size),
+        &blockchain_state.account_set,
+        calc_coinbase(block_size(&block), median_block_size),
     )?;
 
-    check_name_changes(&block.name_changes, blockchain_state.name_set);
+    check_name_changes(&block.name_changes, &blockchain_state.name_set)?;
 
     Ok(())
+}
+
+pub fn median_block_size(values: &[usize; 100]) -> usize {
+    let mut block_sizes = values.clone();
+    block_sizes.sort_unstable();
+    block_sizes[50]
 }
 
 //
