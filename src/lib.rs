@@ -1,40 +1,59 @@
+use secp256k1::{schnorr::Signature, Secp256k1, XOnlyPublicKey};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-use secp256k1::{schnorr::Signature, XOnlyPublicKey};
-use sha2::{Digest, Sha256};
-
-struct Block {
+pub struct Block {
     header: Header,
     txns: Vec<Txn>,
+    name_changes: Vec<RenameOp>,
 }
 
-struct Txn {
+pub struct Txn {
     sender: [u8; 32],
     recievers: Vec<([u8; 32], u64)>,
     signature: [u8; 64],
     fee: u64,
 }
 
-struct Header {
+// In a rename operation, the fee is always paid by the new pk.
+// If a person already owns the name, their pk must be the one that signs this txn. Otherwise, the new pk signs it.
+pub struct RenameOp {
+    pk: [u8; 32],
+    sig: [u8; 64],
+    new_name: String,
+    fee: u64,
+}
+
+pub struct Header {
     prev_block_hash: [u8; 32],
     merkle_root: [u8; 32],
     time: u64,
     nonce: u64,
 }
 
-struct BlockchainState<'a> {
-    account_set: &'a Accounts,
+pub struct BlockchainState {
+    account_set: Accounts,
+    name_set: Names,
     difficulty: [u8; 32],
-    median_time: u64,
-    median_block_size: usize,
+    height: usize,
+    last_720_times: [u64; 720],
+    last_100_block_sizes: [usize; 100],
     previous_block: Block,
 }
 
-type Accounts = std::collections::HashMap<[u8; 32], u64>;
+pub struct UndoBlock {
+    removed_time: u64,
+    removed_block_size: usize,
+    previous_block: Block,
+}
 
-const HEADER_SIZE: usize = 80;
-const FEES_PER_BYTE: u64 = 2_000_000;
+pub type Accounts = HashMap<[u8; 32], u64>;
+pub type Names = HashMap<String, [u8; 32]>;
 
+pub const HEADER_SIZE: usize = 80;
+pub const TXN_FEES_PER_BYTE: u64 = 400_000;
+pub const NAME_CHANGE_FEES_PER_BYTE: u64 = 100_000_000;
+//
 pub enum Error {
     BlockValidationError(String),
     TxnValidationError(String),
@@ -53,7 +72,11 @@ macro_rules! txn_validation_error {
 }
 
 // Takes a validated block and updates the account set
-fn push_block(block: &Block, account_set: &mut Accounts) {
+fn push_block(block: Block, blockchain_state: &mut BlockchainState) -> UndoBlock {
+    let account_set = &mut blockchain_state.account_set;
+    let name_set = &mut blockchain_state.name_set;
+
+    // Execute transactions
     for txn in block.txns.iter() {
         let total_spend = txn_total_spend(txn);
 
@@ -68,6 +91,43 @@ fn push_block(block: &Block, account_set: &mut Accounts) {
                 .or_insert(reciever.1);
         }
     }
+
+    // Execute name changes
+    for op in block.name_changes.iter() {
+        name_set.insert(op.new_name.clone(), op.pk);
+
+        if account_set[&op.pk] == op.fee {
+            account_set.remove(&op.pk);
+        } else {
+            account_set.entry(op.pk).and_modify(|a| *a -= op.fee);
+        }
+    }
+
+    // Shift the running totals
+    let removed_time = push_to_front(&mut blockchain_state.last_720_times, block.header.time);
+    let removed_block_size = push_to_front(
+        &mut blockchain_state.last_100_block_sizes,
+        block_size(&block),
+    );
+
+    UndoBlock {
+        removed_time,
+        removed_block_size,
+        previous_block: block,
+    }
+}
+
+// Could be optimized using Vec::pop_front, but this isn't a bottleneck so I will stick with simplicity.
+pub fn push_to_front<T: Copy + Default>(arr: &mut [T], item: T) -> T {
+    let output = arr[0];
+
+    for i in 0..(arr.len() - 1) {
+        arr[i] = arr[i + 1];
+    }
+
+    arr[arr.len() - 1] = item;
+
+    output
 }
 
 // Takes the most recently applied block and undoes its transactions
@@ -107,7 +167,7 @@ fn validate_block(block: &Block, blockchain_state: &BlockchainState) -> Result<(
         block_validation_error!("Block time is less than previous block time");
     }
 
-    if merkle_root(&block.txns) != block.header.merkle_root {
+    if merkle_root(&block.txns, &block.name_changes) != block.header.merkle_root {
         block_validation_error!("Header merkle root does not match calculated merkle root");
     }
 
@@ -130,8 +190,78 @@ fn validate_block(block: &Block, blockchain_state: &BlockchainState) -> Result<(
         calc_coinbase(block_size(&block), blockchain_state.median_block_size),
     )?;
 
+    check_name_changes(&block.name_changes, blockchain_state.name_set);
+
     Ok(())
 }
+
+//
+// --- NAME CHANGE VALIDATION FUNCTIONS
+//
+
+pub fn check_name_changes(op_list: &Vec<RenameOp>, name_set: &Names) -> Result<(), Error> {
+    for op in op_list.iter() {
+        check_name_change(&op, &name_set)?;
+    }
+    Ok(())
+}
+
+pub fn check_name_change(op: &RenameOp, name_set: &Names) -> Result<(), Error> {
+    let pk = XOnlyPublicKey::from_byte_array(&op.pk).map_err(|_| {
+        Error::TxnValidationError(
+            "Rename operation used a pk that isn't a point on the curve".into(),
+        )
+    })?;
+
+    let signer;
+
+    if name_set.contains_key(&op.new_name) {
+        signer = XOnlyPublicKey::from_byte_array(name_set.get(&op.new_name).unwrap()).unwrap();
+    } else {
+        signer = pk;
+    }
+
+    let encoded_op = encode_name_change(op);
+    let sig = Signature::from_byte_array(op.sig);
+    let secp = Secp256k1::new();
+
+    secp.verify_schnorr(&sig, &hash(encoded_op.as_slice()), &pk)
+        .map_err(|_| Error::TxnValidationError("Name-change signature was invalid".into()))?;
+
+    let fee = (encoded_op.len() as u64) * NAME_CHANGE_FEES_PER_BYTE;
+
+    if op.fee < fee {
+        txn_validation_error!("Rename does not pay enough in fees");
+    }
+
+    if op.new_name.bytes().len() > 255 {
+        txn_validation_error!("New name was greater than 255 bytes");
+    }
+
+    Ok(())
+}
+
+pub fn name_change_hash(change: &RenameOp) -> [u8; 32] {
+    hash(encode_name_change(change).as_slice())
+}
+
+pub fn encode_name_change(change: &RenameOp) -> Vec<u8> {
+    let mut data: Vec<u8> = vec![];
+
+    data.extend(change.pk.iter());
+    data.extend(change.sig.iter());
+
+    let bytes = change.new_name.bytes();
+    data.push(bytes.len() as u8);
+    data.extend(bytes);
+    data.extend(change.fee.to_le_bytes());
+
+    data
+}
+
+//
+// --- TXN VALIDATION FUNCTIONS ---
+//
 
 pub fn check_txns(txn_list: &Vec<Txn>, account_set: &Accounts, coinbase: u64) -> Result<(), Error> {
     let mut fees = 0;
@@ -198,7 +328,7 @@ pub fn check_txn(txn: &Txn, account_set: &Accounts) -> Result<(), Error> {
         ))?;
 
     let size = encode_txn(txn).len() as u64;
-    let min_fee = FEES_PER_BYTE * size;
+    let min_fee = TXN_FEES_PER_BYTE * size;
 
     if txn.fee < min_fee {
         txn_validation_error!("Txn doesn't pay enough in fees");
@@ -208,10 +338,20 @@ pub fn check_txn(txn: &Txn, account_set: &Accounts) -> Result<(), Error> {
 }
 
 pub fn block_size(block: &Block) -> usize {
-    let mut size = size_of::<Header>();
+    let mut size = HEADER_SIZE;
+
+    // 32 bit unsigned int representing the num of txns in the block
+    size += 4;
 
     for txn in block.txns.iter() {
         size += encode_txn(&txn).len();
+    }
+
+    // 32 bit unsigned int representing the num of name-changes in the block
+    size += 4;
+
+    for rename in block.name_changes.iter() {
+        size += encode_name_change(rename).len();
     }
 
     return size;
@@ -230,31 +370,6 @@ pub fn calc_coinbase(block_size: usize, median_block_size: usize) -> u64 {
     } else {
         1_000_000_000_000
     }
-}
-
-pub fn merkle_root(txn_list: &Vec<Txn>) -> [u8; 32] {
-    let mut hashes: Vec<[u8; 32]> = txn_list.iter().map(|txn| txn_hash(&txn)).collect();
-    let mut new_hashes = vec![];
-
-    while hashes.len() > 1 {
-        for i in (0..hashes.len()).step_by(2) {
-            let mut data = [0; 64];
-            data[0..32].copy_from_slice(&hashes[i]);
-
-            if i + 1 < hashes.len() {
-                data[32..64].copy_from_slice(&hashes[i + 1]);
-            } else {
-                data[32..64].copy_from_slice(&hashes[i]);
-            }
-
-            new_hashes.push(sha2::Sha256::digest(data).try_into().unwrap());
-        }
-
-        hashes = new_hashes;
-        new_hashes = vec![];
-    }
-
-    hashes[0]
 }
 
 pub fn txn_hash(txn: &Txn) -> [u8; 32] {
@@ -276,6 +391,44 @@ pub fn encode_txn(txn: &Txn) -> Vec<u8> {
     data.extend(txn.fee.to_le_bytes().iter());
 
     data
+}
+
+//
+// --- HEADER VALIDATION FUNCTIONS ---
+//
+
+pub fn merkle_root(txn_list: &Vec<Txn>, name_changes: &Vec<RenameOp>) -> [u8; 32] {
+    let mut hashes: Vec<[u8; 32]> = txn_list.iter().map(|txn| txn_hash(&txn)).collect();
+
+    hashes.extend(
+        name_changes
+            .iter()
+            .map(|op| name_change_hash(&op))
+            .collect::<Vec<[u8; 32]>>()
+            .iter(),
+    );
+
+    let mut new_hashes = vec![];
+
+    while hashes.len() > 1 {
+        for i in (0..hashes.len()).step_by(2) {
+            let mut data = [0; 64];
+            data[0..32].copy_from_slice(&hashes[i]);
+
+            if i + 1 < hashes.len() {
+                data[32..64].copy_from_slice(&hashes[i + 1]);
+            } else {
+                data[32..64].copy_from_slice(&hashes[i]);
+            }
+
+            new_hashes.push(sha2::Sha256::digest(data).try_into().unwrap());
+        }
+
+        hashes = new_hashes;
+        new_hashes = vec![];
+    }
+
+    hashes[0]
 }
 
 pub fn encode_header(header: &Header) -> [u8; HEADER_SIZE] {
