@@ -1,6 +1,6 @@
 use secp256k1::{schnorr::Signature, Secp256k1, XOnlyPublicKey};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::{collections::HashMap, env::consts::OS};
 
 pub struct Block {
     header: Header,
@@ -176,6 +176,24 @@ fn pop_block(undo_block: &UndoBlock, blockchain_state: &mut BlockchainState) {
             name_set.insert(name_change.name.clone(), name_change.old_pk.unwrap());
         }
     }
+
+    push_to_back(
+        &mut blockchain_state.last_100_block_sizes,
+        undo_block.removed_block_size,
+    );
+
+    push_to_back(
+        &mut blockchain_state.last_720_times,
+        undo_block.removed_time,
+    );
+}
+
+pub fn push_to_back<T: Copy + Default>(arr: &mut [T], item: T) {
+    for i in 1..arr.len() {
+        arr[i + 1] = arr[i];
+    }
+
+    arr[0] = item;
 }
 
 // Takes a block and ensures that it meets all required rules
