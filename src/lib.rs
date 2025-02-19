@@ -3,16 +3,16 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 pub struct Block {
-    header: Header,
-    txns: Vec<Txn>,
-    name_changes: Vec<RenameOp>,
+    pub header: Header,
+    pub txns: Vec<Txn>,
+    pub name_changes: Vec<RenameOp>,
 }
 
 pub struct Txn {
-    sender: Address,
-    recievers: Vec<(Address, u64)>,
-    signature: [u8; 64],
-    fee: u64,
+    pub sender: Address,
+    pub recievers: Vec<(Address, u64)>,
+    pub signature: [u8; 64],
+    pub fee: u64,
 }
 
 pub enum Address {
@@ -23,27 +23,27 @@ pub enum Address {
 // In a rename operation, the fee is always paid by the new pk.
 // If a person already owns the name, their pk must be the one that signs this txn. Otherwise, the new pk signs it.
 pub struct RenameOp {
-    pk: [u8; 32],
-    sig: [u8; 64],
-    new_name: String,
-    fee: u64,
+    pub pk: [u8; 32],
+    pub sig: [u8; 64],
+    pub new_name: String,
+    pub fee: u64,
 }
 
 pub struct Header {
-    prev_block_hash: [u8; 32],
-    merkle_root: [u8; 32],
-    time: u64,
-    nonce: u64,
+    pub prev_block_hash: [u8; 32],
+    pub merkle_root: [u8; 32],
+    pub time: u64,
+    pub nonce: u64,
 }
 
 pub struct BlockchainState {
-    account_set: Accounts,
-    name_set: Names,
-    difficulty: [u8; 32],
-    height: usize,
-    last_720_times: [u64; 720],
-    last_100_block_sizes: [usize; 100],
-    previous_block: Block,
+    pub account_set: Accounts,
+    pub name_set: Names,
+    pub difficulty: [u8; 32],
+    pub height: usize,
+    pub last_720_times: [u64; 720],
+    pub last_100_block_sizes: [usize; 100],
+    pub previous_block: Block,
 }
 
 pub struct UndoBlock {
