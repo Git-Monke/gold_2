@@ -1,6 +1,6 @@
 use secp256k1::{schnorr::Signature, Secp256k1, XOnlyPublicKey};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, env::consts::OS};
+use std::collections::HashMap;
 
 pub struct Block {
     header: Header,
@@ -9,10 +9,15 @@ pub struct Block {
 }
 
 pub struct Txn {
-    sender: [u8; 32],
-    recievers: Vec<([u8; 32], u64)>,
+    sender: Address,
+    recievers: Vec<(Address, u64)>,
     signature: [u8; 64],
     fee: u64,
+}
+
+pub enum Address {
+    Key([u8; 32]),
+    Name(String),
 }
 
 // In a rename operation, the fee is always paid by the new pk.
@@ -64,6 +69,7 @@ pub const NAME_CHANGE_FEES_PER_BYTE: u64 = 100_000_000;
 pub enum Error {
     BlockValidationError(String),
     TxnValidationError(String),
+    MissingDataError,
 }
 
 macro_rules! block_validation_error {
@@ -82,7 +88,8 @@ macro_rules! txn_validation_error {
 fn push_block(block: Block, blockchain_state: &mut BlockchainState) -> UndoBlock {
     let account_set = &mut blockchain_state.account_set;
     let name_set = &mut blockchain_state.name_set;
-    // stores all the name change operation undos.
+
+    // Any time a name change occurs, the data must be stored in case of an undo. This is later stored in the undo block.
     let mut name_undos = vec![];
 
     // Execute transactions
@@ -90,12 +97,12 @@ fn push_block(block: Block, blockchain_state: &mut BlockchainState) -> UndoBlock
         let total_spend = txn_total_spend(txn);
 
         account_set
-            .entry(txn.sender)
+            .entry(address_to_key_unchecked(&txn.sender, name_set))
             .and_modify(|a| *a -= total_spend);
 
         for reciever in txn.recievers.iter() {
             account_set
-                .entry(reciever.0)
+                .entry(address_to_key_unchecked(&reciever.0, name_set))
                 .and_modify(|a| *a += reciever.1)
                 .or_insert(reciever.1);
         }
@@ -147,33 +154,33 @@ pub fn push_to_front<T: Copy + Default>(arr: &mut [T], item: T) -> T {
 }
 
 // Takes the most recently applied block and undoes its transactions
+// In a normal block, name changes are done after txns. So for the undo block, you must reverse the name-changes first.
 fn pop_block(undo_block: &UndoBlock, blockchain_state: &mut BlockchainState) {
     let account_set = &mut blockchain_state.account_set;
-
-    for txn in undo_block.txns.iter() {
-        let total_spend = txn_total_spend(txn);
-
-        account_set
-            .entry(txn.sender)
-            .and_modify(|a| *a += total_spend);
-
-        for reciever in txn.recievers.iter() {
-            // if the reciever has a balance equal to as much as they were sent in this txn, their balance will be 0 after. Remove from the account set.
-            if account_set[&reciever.0] == reciever.1 {
-                account_set.remove(&reciever.0);
-            } else {
-                account_set
-                    .entry(reciever.0)
-                    .and_modify(|a| *a -= reciever.1);
-            }
-        }
-    }
-
     let name_set = &mut blockchain_state.name_set;
 
     for name_change in undo_block.name_changes.iter() {
         if name_change.old_pk.is_some() {
             name_set.insert(name_change.name.clone(), name_change.old_pk.unwrap());
+        }
+    }
+
+    for txn in undo_block.txns.iter() {
+        let total_spend = txn_total_spend(txn);
+
+        account_set
+            .entry(address_to_key_unchecked(&txn.sender, name_set))
+            .and_modify(|a| *a += total_spend);
+
+        for reciever in txn.recievers.iter() {
+            // if the reciever has a balance equal to as much as they were sent in this txn, their balance will be 0 after. Remove from the account set.
+            let key = address_to_key_unchecked(&reciever.0, name_set);
+
+            if account_set[&key] == reciever.1 {
+                account_set.remove(&key);
+            } else {
+                account_set.entry(key).and_modify(|a| *a -= reciever.1);
+            }
         }
     }
 
@@ -186,6 +193,21 @@ fn pop_block(undo_block: &UndoBlock, blockchain_state: &mut BlockchainState) {
         &mut blockchain_state.last_720_times,
         undo_block.removed_time,
     );
+}
+
+// Will panic if the name is not in the Names set. Only use in functions where the txns have already been validated.
+pub fn address_to_key_unchecked(address: &Address, names: &Names) -> [u8; 32] {
+    match address {
+        Address::Name(n) => *names.get(n).unwrap(),
+        Address::Key(k) => *k,
+    }
+}
+
+pub fn address_to_key(address: &Address, names: &Names) -> Result<[u8; 32], Error> {
+    match address {
+        Address::Name(n) => names.get(n).map(|k| *k).ok_or(Error::MissingDataError),
+        Address::Key(k) => Ok(*k),
+    }
 }
 
 pub fn push_to_back<T: Copy + Default>(arr: &mut [T], item: T) {
@@ -232,7 +254,7 @@ fn validate_block(block: &Block, blockchain_state: &BlockchainState) -> Result<(
 
     check_txns(
         &block.txns,
-        &blockchain_state.account_set,
+        blockchain_state,
         calc_coinbase(block_size(&block), median_block_size),
     )?;
 
@@ -315,7 +337,11 @@ pub fn encode_name_change(change: &RenameOp) -> Vec<u8> {
 // --- TXN VALIDATION FUNCTIONS ---
 //
 
-pub fn check_txns(txn_list: &Vec<Txn>, account_set: &Accounts, coinbase: u64) -> Result<(), Error> {
+pub fn check_txns(
+    txn_list: &Vec<Txn>,
+    blockchain_state: &BlockchainState,
+    coinbase: u64,
+) -> Result<(), Error> {
     let mut fees = 0;
     // The cumulative amount each user has spent in the block. Used for making sure multiple transactions don't add up to more than the users total balance
     let mut total_spend: HashMap<[u8; 32], u64> = HashMap::new();
@@ -325,18 +351,23 @@ pub fn check_txns(txn_list: &Vec<Txn>, account_set: &Accounts, coinbase: u64) ->
             continue;
         }
 
-        check_txn(&txn, account_set)?;
+        check_txn(&txn, blockchain_state)?;
+        let sender_key = address_to_key_unchecked(&txn.sender, &blockchain_state.name_set);
 
         // check_txn verifies the account is in the set, so this will always unwrap properly
-        let balance = account_set.get(&txn.sender).copied().unwrap();
-        let current_spend = total_spend.get(&txn.sender).copied().unwrap_or(0);
+        let balance = blockchain_state
+            .account_set
+            .get(&sender_key)
+            .copied()
+            .unwrap();
+        let current_spend = total_spend.get(&sender_key).copied().unwrap_or(0);
         let spend = txn_total_spend(&txn);
 
         if (spend + current_spend) > balance {
             txn_validation_error!("Sender tried to spend more than their balance");
         }
 
-        total_spend.entry(txn.sender).and_modify(|a| *a += spend);
+        total_spend.entry(sender_key).and_modify(|a| *a += spend);
 
         fees += txn.fee;
     }
@@ -361,8 +392,10 @@ pub fn txn_total_spend(txn: &Txn) -> u64 {
 }
 
 // checks the data is valid, the fee matches the txn size, but doesn't check if the amount they're trying to spend is valid
-pub fn check_txn(txn: &Txn, account_set: &Accounts) -> Result<(), Error> {
-    let key = XOnlyPublicKey::from_byte_array(&txn.sender).map_err(|_| {
+pub fn check_txn(txn: &Txn, blockchain_state: &BlockchainState) -> Result<(), Error> {
+    let sender_key = address_to_key(&txn.sender, &blockchain_state.name_set)?;
+
+    let key = XOnlyPublicKey::from_byte_array(&sender_key).map_err(|_| {
         Error::TxnValidationError("The sender's public key isn't a point on the curve".into())
     })?;
 
@@ -373,8 +406,9 @@ pub fn check_txn(txn: &Txn, account_set: &Accounts) -> Result<(), Error> {
         .verify_schnorr(&sig, &encode_txn(&txn), &key)
         .map_err(|e| Error::TxnValidationError(e.to_string()))?;
 
-    account_set
-        .get(&txn.sender)
+    blockchain_state
+        .account_set
+        .get(&sender_key)
         .ok_or(Error::TxnValidationError(
             "The sender's pk isn't in the account set".into(),
         ))?;
@@ -431,11 +465,11 @@ pub fn txn_hash(txn: &Txn) -> [u8; 32] {
 pub fn encode_txn(txn: &Txn) -> Vec<u8> {
     let mut data = vec![];
 
-    data.extend(txn.sender.iter());
+    encode_address(&txn.sender, &mut data);
     data.push(txn.recievers.len() as u8);
 
     for reciever in txn.recievers.iter() {
-        data.extend(reciever.0.iter());
+        encode_address(&reciever.0, &mut data);
         data.extend(reciever.1.to_le_bytes().iter());
     }
 
@@ -443,6 +477,20 @@ pub fn encode_txn(txn: &Txn) -> Vec<u8> {
     data.extend(txn.fee.to_le_bytes().iter());
 
     data
+}
+
+pub fn encode_address(address: &Address, data: &mut Vec<u8>) {
+    match address {
+        Address::Name(n) => {
+            data.push(1);
+            data.push(n.len() as u8);
+            data.extend(n.as_bytes().iter());
+        }
+        Address::Key(k) => {
+            data.push(0);
+            data.extend(k.iter());
+        }
+    }
 }
 
 //
