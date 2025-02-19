@@ -63,8 +63,11 @@ pub type Accounts = HashMap<[u8; 32], u64>;
 pub type Names = HashMap<String, [u8; 32]>;
 
 pub const HEADER_SIZE: usize = 80;
+
 pub const TXN_FEES_PER_BYTE: u64 = 400_000;
 pub const NAME_CHANGE_FEES_PER_BYTE: u64 = 100_000_000;
+
+pub const DEFAULT_COINBASE: u64 = 200_000_000_000;
 //
 pub enum Error {
     BlockValidationError(String),
@@ -247,15 +250,16 @@ fn validate_block(block: &Block, blockchain_state: &BlockchainState) -> Result<(
     // validate other qualities
 
     let median_block_size = median_block_size(&blockchain_state.last_100_block_sizes);
+    let block_size = block_size(&block);
 
-    if block_size(&block) > 2 * median_block_size {
+    if block_size > 20_000 && block_size > 2 * median_block_size {
         block_validation_error!("Block is bigger than twice the median block size")
     }
 
     check_txns(
         &block.txns,
         blockchain_state,
-        calc_coinbase(block_size(&block), median_block_size),
+        calc_coinbase(block_size, median_block_size),
     )?;
 
     check_name_changes(&block.name_changes, &blockchain_state.name_set)?;
@@ -444,17 +448,17 @@ pub fn block_size(block: &Block) -> usize {
 }
 
 pub fn calc_coinbase(block_size: usize, median_block_size: usize) -> u64 {
-    let base = 1_000_000_000f64;
-
     let block_size = block_size as f64;
     let median_block_size = median_block_size as f64;
 
-    if block_size > 50_000f64 && block_size > median_block_size {
-        // calculate fraction, multiplfy by base, convert to u64 to cut off the non-deterministic decimal places, add back the precision.
-        (base * (1f64 - ((block_size - median_block_size) / (median_block_size))).powi(2)) as u64
-            * 1_000
+    if block_size - median_block_size > 10_000f64 && block_size - 10_000f64 > median_block_size {
+        // The first 10kb of any block is given for free. This is equal to about 70 transactions, or 1 transaction every 2 seconds.
+        // This was chosen purposefully. If blocks remain exactly 10kb, that fixes blockchain growth at 2GB/yr. This is negligible.
+        let percent = 1f64 - ((block_size - 10_000f64 - median_block_size) / median_block_size);
+        println!("{percent}");
+        ((DEFAULT_COINBASE as f64) / 1000_f64 * percent.powi(2)) as u64 * 1_000
     } else {
-        1_000_000_000_000
+        DEFAULT_COINBASE
     }
 }
 
