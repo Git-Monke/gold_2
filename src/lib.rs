@@ -1,13 +1,16 @@
 use secp256k1::{schnorr::Signature, Secp256k1, XOnlyPublicKey};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::{collections::HashMap, env::consts::OS};
+use thiserror::Error;
 
+#[derive(Debug)]
 pub struct Block {
     pub header: Header,
     pub txns: Vec<Txn>,
     pub name_changes: Vec<RenameOp>,
 }
 
+#[derive(Debug)]
 pub struct Txn {
     pub sender: Address,
     pub recievers: Vec<(Address, u64)>,
@@ -15,6 +18,7 @@ pub struct Txn {
     pub fee: u64,
 }
 
+#[derive(Debug)]
 pub enum Address {
     Key([u8; 32]),
     Name(String),
@@ -22,6 +26,7 @@ pub enum Address {
 
 // In a rename operation, the fee is always paid by the new pk.
 // If a person already owns the name, their pk must be the one that signs this txn. Otherwise, the new pk signs it.
+#[derive(Debug)]
 pub struct RenameOp {
     pub pk: [u8; 32],
     pub sig: [u8; 64],
@@ -29,6 +34,7 @@ pub struct RenameOp {
     pub fee: u64,
 }
 
+#[derive(Debug)]
 pub struct Header {
     pub prev_block_hash: [u8; 32],
     pub merkle_root: [u8; 32],
@@ -68,10 +74,14 @@ pub const TXN_FEES_PER_BYTE: u64 = 400_000;
 pub const NAME_CHANGE_FEES_PER_BYTE: u64 = 100_000_000;
 
 pub const DEFAULT_COINBASE: u64 = 200_000_000_000;
-//
+
+#[derive(Debug, Error)]
 pub enum Error {
+    #[error("The block failed to validate because {0}")]
     BlockValidationError(String),
+    #[error("A txn failed to validate because {0}")]
     TxnValidationError(String),
+    #[error("A transaction referenced a name that is not in the name set")]
     MissingDataError,
 }
 
@@ -87,6 +97,7 @@ macro_rules! txn_validation_error {
     };
 }
 
+// ! TODO Add difficulty adjustment
 // Takes a validated block and updates the account set
 fn push_block(block: Block, blockchain_state: &mut BlockchainState) -> UndoBlock {
     let account_set = &mut blockchain_state.account_set;
@@ -156,6 +167,7 @@ pub fn push_to_front<T: Copy + Default>(arr: &mut [T], item: T) -> T {
     output
 }
 
+// ! TODO Add difficulty adjustment
 // Takes the most recently applied block and undoes its transactions
 // In a normal block, name changes are done after txns. So for the undo block, you must reverse the name-changes first.
 fn pop_block(undo_block: &UndoBlock, blockchain_state: &mut BlockchainState) {
@@ -222,13 +234,14 @@ pub fn push_to_back<T: Copy + Default>(arr: &mut [T], item: T) {
 }
 
 // Takes a block and ensures that it meets all required rules
-fn validate_block(block: &Block, blockchain_state: &BlockchainState) -> Result<(), Error> {
+pub fn validate_block(block: &Block, blockchain_state: &BlockchainState) -> Result<(), Error> {
     // validate header
 
-    if !(meets_difficulty(
-        &hash(&encode_header(&block.header)),
-        &blockchain_state.difficulty,
-    )) {
+    if block.txns.len() < 1 {
+        block_validation_error!("The block contains no transactions (coinbase txn is mandatory)")
+    }
+
+    if !(meets_difficulty(&hash_header(&block.header), &blockchain_state.difficulty)) {
         block_validation_error!("Header hash does not meet required difficulty");
     }
 
@@ -265,6 +278,10 @@ fn validate_block(block: &Block, blockchain_state: &BlockchainState) -> Result<(
     check_name_changes(&block.name_changes, &blockchain_state.name_set)?;
 
     Ok(())
+}
+
+pub fn hash_header(header: &Header) -> [u8; 32] {
+    hash(&encode_header(header))
 }
 
 pub fn median_block_size(values: &[usize; 100]) -> usize {
@@ -351,7 +368,7 @@ pub fn check_txns(
     let mut total_spend: HashMap<[u8; 32], u64> = HashMap::new();
 
     for (i, txn) in txn_list.iter().enumerate() {
-        if i == 1 {
+        if i == 0 {
             continue;
         }
 
@@ -502,6 +519,10 @@ pub fn encode_address(address: &Address, data: &mut Vec<u8>) {
 //
 
 pub fn merkle_root(txn_list: &Vec<Txn>, name_changes: &Vec<RenameOp>) -> [u8; 32] {
+    if txn_list.len() == 0 && name_changes.len() == 0 {
+        return [0; 32];
+    }
+
     let mut hashes: Vec<[u8; 32]> = txn_list.iter().map(|txn| txn_hash(&txn)).collect();
 
     hashes.extend(
@@ -546,7 +567,7 @@ pub fn encode_header(header: &Header) -> [u8; HEADER_SIZE] {
     data
 }
 
-fn meets_difficulty(value: &[u8; 32], difficulty: &[u8; 32]) -> bool {
+pub fn meets_difficulty(value: &[u8; 32], difficulty: &[u8; 32]) -> bool {
     for i in 0..32 {
         if value[i] < difficulty[i] {
             return true;
@@ -561,6 +582,6 @@ fn meets_difficulty(value: &[u8; 32], difficulty: &[u8; 32]) -> bool {
 }
 
 // hash is in a seperate function in case I decide to change the hashing alg later on
-fn hash(data: &[u8]) -> [u8; 32] {
+pub fn hash(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
