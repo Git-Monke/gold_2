@@ -1,4 +1,4 @@
-use secp256k1::{schnorr::Signature, Secp256k1, XOnlyPublicKey};
+use secp256k1::{schnorr::Signature, Keypair, Secp256k1, XOnlyPublicKey};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, env::consts::OS};
 use thiserror::Error;
@@ -10,7 +10,7 @@ pub struct Block {
     pub name_changes: Vec<RenameOp>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Txn {
     pub sender: Address,
     pub recievers: Vec<(Address, u64)>,
@@ -18,7 +18,7 @@ pub struct Txn {
     pub fee: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Address {
     Key([u8; 32]),
     Name(String),
@@ -154,19 +154,6 @@ fn push_block(block: Block, blockchain_state: &mut BlockchainState) -> UndoBlock
     }
 }
 
-// Could be optimized using Vec::pop_front, but this isn't a bottleneck so I will stick with simplicity.
-pub fn push_to_front<T: Copy + Default>(arr: &mut [T], item: T) -> T {
-    let output = arr[0];
-
-    for i in 0..(arr.len() - 1) {
-        arr[i] = arr[i + 1];
-    }
-
-    arr[arr.len() - 1] = item;
-
-    output
-}
-
 // ! TODO Add difficulty adjustment
 // Takes the most recently applied block and undoes its transactions
 // In a normal block, name changes are done after txns. So for the undo block, you must reverse the name-changes first.
@@ -208,29 +195,6 @@ fn pop_block(undo_block: &UndoBlock, blockchain_state: &mut BlockchainState) {
         &mut blockchain_state.last_720_times,
         undo_block.removed_time,
     );
-}
-
-// Will panic if the name is not in the Names set. Only use in functions where the txns have already been validated.
-pub fn address_to_key_unchecked(address: &Address, names: &Names) -> [u8; 32] {
-    match address {
-        Address::Name(n) => *names.get(n).unwrap(),
-        Address::Key(k) => *k,
-    }
-}
-
-pub fn address_to_key(address: &Address, names: &Names) -> Result<[u8; 32], Error> {
-    match address {
-        Address::Name(n) => names.get(n).map(|k| *k).ok_or(Error::MissingDataError),
-        Address::Key(k) => Ok(*k),
-    }
-}
-
-pub fn push_to_back<T: Copy + Default>(arr: &mut [T], item: T) {
-    for i in 1..arr.len() {
-        arr[i + 1] = arr[i];
-    }
-
-    arr[0] = item;
 }
 
 // Takes a block and ensures that it meets all required rules
@@ -280,16 +244,6 @@ pub fn validate_block(block: &Block, blockchain_state: &BlockchainState) -> Resu
     Ok(())
 }
 
-pub fn hash_header(header: &Header) -> [u8; 32] {
-    hash(&encode_header(header))
-}
-
-pub fn median_block_size(values: &[usize; 100]) -> usize {
-    let mut block_sizes = values.clone();
-    block_sizes.sort_unstable();
-    block_sizes[50]
-}
-
 //
 // --- NAME CHANGE VALIDATION FUNCTIONS
 //
@@ -334,24 +288,6 @@ pub fn check_name_change(op: &RenameOp, name_set: &Names) -> Result<(), Error> {
     }
 
     Ok(())
-}
-
-pub fn name_change_hash(change: &RenameOp) -> [u8; 32] {
-    hash(encode_name_change(change).as_slice())
-}
-
-pub fn encode_name_change(change: &RenameOp) -> Vec<u8> {
-    let mut data: Vec<u8> = vec![];
-
-    data.extend(change.pk.iter());
-    data.extend(change.sig.iter());
-
-    let bytes = change.new_name.bytes();
-    data.push(bytes.len() as u8);
-    data.extend(bytes);
-    data.extend(change.fee.to_le_bytes());
-
-    data
 }
 
 //
@@ -404,14 +340,6 @@ pub fn check_txns(
     Ok(())
 }
 
-pub fn txn_total_spend(txn: &Txn) -> u64 {
-    let mut sum = 0;
-    for output in txn.recievers.iter() {
-        sum += output.1;
-    }
-    sum + txn.fee
-}
-
 // checks the data is valid, the fee matches the txn size, but doesn't check if the amount they're trying to spend is valid
 pub fn check_txn(txn: &Txn, blockchain_state: &BlockchainState) -> Result<(), Error> {
     let sender_key = address_to_key(&txn.sender, &blockchain_state.name_set)?;
@@ -422,6 +350,9 @@ pub fn check_txn(txn: &Txn, blockchain_state: &BlockchainState) -> Result<(), Er
 
     let curve = secp256k1::Secp256k1::new();
     let sig = Signature::from_byte_array(txn.signature);
+
+    let mut txn = txn.clone();
+    txn.signature = [0; 64];
 
     curve
         .verify_schnorr(&sig, &encode_txn(&txn), &key)
@@ -434,7 +365,7 @@ pub fn check_txn(txn: &Txn, blockchain_state: &BlockchainState) -> Result<(), Er
             "The sender's pk isn't in the account set".into(),
         ))?;
 
-    let size = encode_txn(txn).len() as u64;
+    let size = encode_txn(&txn).len() as u64;
     let min_fee = TXN_FEES_PER_BYTE * size;
 
     if txn.fee < min_fee {
@@ -442,76 +373,6 @@ pub fn check_txn(txn: &Txn, blockchain_state: &BlockchainState) -> Result<(), Er
     }
 
     Ok(())
-}
-
-pub fn block_size(block: &Block) -> usize {
-    let mut size = HEADER_SIZE;
-
-    // 32 bit unsigned int representing the num of txns in the block
-    size += 4;
-
-    for txn in block.txns.iter() {
-        size += encode_txn(&txn).len();
-    }
-
-    // 32 bit unsigned int representing the num of name-changes in the block
-    size += 4;
-
-    for rename in block.name_changes.iter() {
-        size += encode_name_change(rename).len();
-    }
-
-    return size;
-}
-
-pub fn calc_coinbase(block_size: usize, median_block_size: usize) -> u64 {
-    let block_size = block_size as f64;
-    let median_block_size = median_block_size as f64;
-
-    if block_size - median_block_size > 10_000f64 && block_size - 10_000f64 > median_block_size {
-        // The first 10kb of any block is given for free. This is equal to about 70 transactions, or 1 transaction every 2 seconds.
-        // This was chosen purposefully. If blocks remain exactly 10kb, that fixes blockchain growth at 2GB/yr. This is negligible.
-        let percent = 1f64 - ((block_size - 10_000f64 - median_block_size) / median_block_size);
-        println!("{percent}");
-        ((DEFAULT_COINBASE as f64) / 1000_f64 * percent.powi(2)) as u64 * 1_000
-    } else {
-        DEFAULT_COINBASE
-    }
-}
-
-pub fn txn_hash(txn: &Txn) -> [u8; 32] {
-    hash(&encode_txn(txn))
-}
-
-pub fn encode_txn(txn: &Txn) -> Vec<u8> {
-    let mut data = vec![];
-
-    encode_address(&txn.sender, &mut data);
-    data.push(txn.recievers.len() as u8);
-
-    for reciever in txn.recievers.iter() {
-        encode_address(&reciever.0, &mut data);
-        data.extend(reciever.1.to_le_bytes().iter());
-    }
-
-    data.extend(txn.signature.iter());
-    data.extend(txn.fee.to_le_bytes().iter());
-
-    data
-}
-
-pub fn encode_address(address: &Address, data: &mut Vec<u8>) {
-    match address {
-        Address::Name(n) => {
-            data.push(1);
-            data.push(n.len() as u8);
-            data.extend(n.as_bytes().iter());
-        }
-        Address::Key(k) => {
-            data.push(0);
-            data.extend(k.iter());
-        }
-    }
 }
 
 //
@@ -556,17 +417,6 @@ pub fn merkle_root(txn_list: &Vec<Txn>, name_changes: &Vec<RenameOp>) -> [u8; 32
     hashes[0]
 }
 
-pub fn encode_header(header: &Header) -> [u8; HEADER_SIZE] {
-    let mut data = [0_u8; 80];
-
-    data[0..32].copy_from_slice(&header.prev_block_hash[0..32]);
-    data[32..64].copy_from_slice(&header.merkle_root[0..32]);
-    data[64..72].copy_from_slice(&header.time.to_le_bytes());
-    data[72..80].copy_from_slice(&header.nonce.to_le_bytes());
-
-    data
-}
-
 pub fn meets_difficulty(value: &[u8; 32], difficulty: &[u8; 32]) -> bool {
     for i in 0..32 {
         if value[i] < difficulty[i] {
@@ -581,7 +431,172 @@ pub fn meets_difficulty(value: &[u8; 32], difficulty: &[u8; 32]) -> bool {
     return true;
 }
 
+// --- RANDOM UTILITY FUNCTIONS
+
 // hash is in a seperate function in case I decide to change the hashing alg later on
 pub fn hash(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
+}
+
+pub fn encode_header(header: &Header) -> [u8; HEADER_SIZE] {
+    let mut data = [0_u8; 80];
+
+    data[0..32].copy_from_slice(&header.prev_block_hash[0..32]);
+    data[32..64].copy_from_slice(&header.merkle_root[0..32]);
+    data[64..72].copy_from_slice(&header.time.to_le_bytes());
+    data[72..80].copy_from_slice(&header.nonce.to_le_bytes());
+
+    data
+}
+
+pub fn txn_hash(txn: &Txn) -> [u8; 32] {
+    hash(&encode_txn(txn))
+}
+
+pub fn encode_txn(txn: &Txn) -> Vec<u8> {
+    let mut data = vec![];
+
+    encode_address(&txn.sender, &mut data);
+    data.push(txn.recievers.len() as u8);
+
+    for reciever in txn.recievers.iter() {
+        encode_address(&reciever.0, &mut data);
+        data.extend(reciever.1.to_le_bytes().iter());
+    }
+
+    data.extend(txn.signature.iter());
+    data.extend(txn.fee.to_le_bytes().iter());
+
+    data
+}
+
+pub fn encode_address(address: &Address, data: &mut Vec<u8>) {
+    match address {
+        Address::Name(n) => {
+            data.push(1);
+            data.push(n.len() as u8);
+            data.extend(n.as_bytes().iter());
+        }
+        Address::Key(k) => {
+            data.push(0);
+            data.extend(k.iter());
+        }
+    }
+}
+
+pub fn block_size(block: &Block) -> usize {
+    let mut size = HEADER_SIZE;
+
+    // 32 bit unsigned int representing the num of txns in the block
+    size += 4;
+
+    for txn in block.txns.iter() {
+        size += encode_txn(&txn).len();
+    }
+
+    // 32 bit unsigned int representing the num of name-changes in the block
+    size += 4;
+
+    for rename in block.name_changes.iter() {
+        size += encode_name_change(rename).len();
+    }
+
+    return size;
+}
+
+pub fn calc_coinbase(block_size: usize, median_block_size: usize) -> u64 {
+    let block_size = block_size as f64;
+    let median_block_size = median_block_size as f64;
+
+    if block_size - median_block_size > 10_000f64 && block_size - 10_000f64 > median_block_size {
+        // The first 10kb of any block is given for free. This is equal to about 70 transactions, or 1 transaction every 2 seconds.
+        // This was chosen purposefully. If blocks remain exactly 10kb, that fixes blockchain growth at 2GB/yr. This is negligible.
+        let percent = 1f64 - ((block_size - 10_000f64 - median_block_size) / median_block_size);
+        println!("{percent}");
+        ((DEFAULT_COINBASE as f64) / 1000_f64 * percent.powi(2)) as u64 * 1_000
+    } else {
+        DEFAULT_COINBASE
+    }
+}
+
+pub fn txn_total_spend(txn: &Txn) -> u64 {
+    let mut sum = 0;
+    for output in txn.recievers.iter() {
+        sum += output.1;
+    }
+    sum + txn.fee
+}
+
+pub fn name_change_hash(change: &RenameOp) -> [u8; 32] {
+    hash(encode_name_change(change).as_slice())
+}
+
+pub fn encode_name_change(change: &RenameOp) -> Vec<u8> {
+    let mut data: Vec<u8> = vec![];
+
+    data.extend(change.pk.iter());
+    data.extend(change.sig.iter());
+
+    let bytes = change.new_name.bytes();
+    data.push(bytes.len() as u8);
+    data.extend(bytes);
+    data.extend(change.fee.to_le_bytes());
+
+    data
+}
+
+pub fn hash_header(header: &Header) -> [u8; 32] {
+    hash(&encode_header(header))
+}
+
+pub fn median_block_size(values: &[usize; 100]) -> usize {
+    let mut block_sizes = values.clone();
+    block_sizes.sort_unstable();
+    block_sizes[50]
+}
+
+// Will panic if the name is not in the Names set. Only use in functions where the txns have already been validated.
+pub fn address_to_key_unchecked(address: &Address, names: &Names) -> [u8; 32] {
+    match address {
+        Address::Name(n) => *names.get(n).unwrap(),
+        Address::Key(k) => *k,
+    }
+}
+
+pub fn address_to_key(address: &Address, names: &Names) -> Result<[u8; 32], Error> {
+    match address {
+        Address::Name(n) => names.get(n).map(|k| *k).ok_or(Error::MissingDataError),
+        Address::Key(k) => Ok(*k),
+    }
+}
+
+pub fn push_to_back<T: Copy + Default>(arr: &mut [T], item: T) {
+    for i in 1..arr.len() {
+        arr[i + 1] = arr[i];
+    }
+
+    arr[0] = item;
+}
+
+// Could be optimized using Vec::pop_front, but this isn't a bottleneck so I will stick with simplicity.
+pub fn push_to_front<T: Copy + Default>(arr: &mut [T], item: T) -> T {
+    let output = arr[0];
+
+    for i in 0..(arr.len() - 1) {
+        arr[i] = arr[i + 1];
+    }
+
+    arr[arr.len() - 1] = item;
+
+    output
+}
+
+// Signs a transaction and sets appropriate fees
+pub fn finalize_txn(txn: &mut Txn, signer_keypair: &Keypair) {
+    let secp = Secp256k1::new();
+    let txn_size = encode_txn(&txn).len();
+    txn.fee = txn_size as u64 * TXN_FEES_PER_BYTE;
+    txn.signature = *secp
+        .sign_schnorr(&encode_txn(txn), signer_keypair)
+        .as_byte_array();
 }

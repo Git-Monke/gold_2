@@ -72,11 +72,20 @@ mod blockchain_validation {
 
     #[test]
     fn validate_block_test() {
+        let secp = Secp256k1::new();
         let (state, keypair) = create_dummy_blockchainstate();
-
         let prev_block_hash = hash(&encode_header(&state.previous_block.header));
 
-        let txns = vec![];
+        let mut example_txn = Txn {
+            sender: Address::Name("GitMonke".into()),
+            recievers: vec![(Address::Key([0; 32]), 100_000)],
+            signature: [0; 64],
+            fee: 10_000,
+        };
+
+        finalize_txn(&mut example_txn, &keypair);
+
+        let txns = vec![example_txn];
         let renames = vec![];
 
         let mut block = Block {
@@ -109,9 +118,11 @@ mod blockchain_validation {
         block.txns[0].recievers[0].1 = coinbase;
         block.header.merkle_root = merkle_root(&block.txns, &block.name_changes);
 
-        let result = validate_block(&block, &state);
+        while !meets_difficulty(&hash_header(&block.header), &state.difficulty) {
+            block.header.nonce += 1;
+        }
 
-        println!("{:?}", &block);
+        let result = validate_block(&block, &state);
 
         assert!(
             result.is_ok(),
