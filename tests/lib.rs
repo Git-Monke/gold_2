@@ -37,7 +37,7 @@ mod blockchain_validation {
         let keypair = Keypair::new(&secp, &mut OsRng);
         let serialized_pk = keypair.x_only_public_key().0.serialize();
 
-        let mut account_set: Accounts = create_dummy_account_set(serialized_pk, 100_000_000);
+        let mut account_set: Accounts = create_dummy_account_set(serialized_pk, 200_000_000_000);
         let mut name_set: Names = create_dummy_name_set("GitMonke".into(), serialized_pk);
 
         let header = Header {
@@ -45,12 +45,6 @@ mod blockchain_validation {
             merkle_root: [0; 32],
             time: 820,
             nonce: 0,
-        };
-
-        let previous_block = Block {
-            header,
-            txns: vec![],
-            name_changes: vec![],
         };
 
         (
@@ -64,17 +58,15 @@ mod blockchain_validation {
                 height: 0,
                 last_720_times: [100; 720],
                 last_100_block_sizes: [10_000; 100],
-                previous_block,
+                previous_block_header: header,
             },
             keypair,
         )
     }
 
-    #[test]
-    fn validate_block_test() {
-        let secp = Secp256k1::new();
+    fn create_dummy_valid_block() -> (BlockchainState, Block, Keypair) {
         let (state, keypair) = create_dummy_blockchainstate();
-        let prev_block_hash = hash(&encode_header(&state.previous_block.header));
+        let prev_block_hash = hash_header(&state.previous_block_header);
 
         let mut example_txn = Txn {
             sender: Address::Name("GitMonke".into()),
@@ -116,12 +108,22 @@ mod blockchain_validation {
         );
 
         block.txns[0].recievers[0].1 = coinbase;
+
+        (state, block, keypair)
+    }
+
+    fn finalize_block(block: &mut Block, state: &BlockchainState) {
         block.header.merkle_root = merkle_root(&block.txns, &block.name_changes);
 
         while !meets_difficulty(&hash_header(&block.header), &state.difficulty) {
             block.header.nonce += 1;
         }
+    }
 
+    #[test]
+    fn validate_block_test() {
+        let (state, mut block, _) = create_dummy_valid_block();
+        finalize_block(&mut block, &state);
         let result = validate_block(&block, &state);
 
         assert!(
@@ -131,49 +133,58 @@ mod blockchain_validation {
         )
     }
 
-    // #[test]
-    // fn brah() {
-    //     let (state, keypair) = create_dummy_blockchainstate();
+    #[test]
+    fn invalid_address() {
+        let (state, mut block, _) = create_dummy_valid_block();
+        block.txns[1].sender = Address::Name("GitMone".into());
+        finalize_block(&mut block, &state);
 
-    //     let prev_block_hash = hash(&encode_header(&state.previous_block.header));
+        let result = validate_block(&block, &state);
 
-    //     let txns = vec![];
-    //     let renames = vec![];
+        assert!(matches!(result, Err(Error::MissingDataError)));
+    }
 
-    //     let mut block = Block {
-    //         header: Header {
-    //             prev_block_hash,
-    //             merkle_root: [0; 32],
-    //             time: 821,
-    //             nonce: 2224777,
-    //         },
-    //         txns,
-    //         name_changes: renames,
-    //     };
+    #[test]
+    fn invalid_coinbase() {
+        let (state, mut block, _) = create_dummy_valid_block();
+        block.txns[0].recievers[0].1 = 300_000_000_000;
+        finalize_block(&mut block, &state);
 
-    //     // inserting the coinbase txn needs refactoring
+        let result = validate_block(&block, &state);
 
-    //     let mut txn = Txn {
-    //         sender: Address::Key([0; 32]),
-    //         recievers: vec![(Address::Name("GitMonke".into()), 0)],
-    //         signature: [0; 64],
-    //         fee: 0,
-    //     };
+        if let Err(Error::TxnValidationError(msg)) = result {
+            assert_eq!(msg, "Coinbase amount is invalid")
+        } else {
+            panic!(
+                "Expected coinbase amount is invalid, got {}",
+                result.unwrap_err()
+            )
+        }
+    }
 
-    //     block.txns.insert(0, txn);
+    #[test]
+    fn invalid_time() {
+        let (state, mut block, _) = create_dummy_valid_block();
+        block.header.time = 99;
+        finalize_block(&mut block, &state);
 
-    //     let coinbase = calc_coinbase(
-    //         block_size(&block),
-    //         median_block_size(&state.last_100_block_sizes),
-    //     );
+        let result = validate_block(&block, &state);
 
-    //     block.txns[0].recievers[0].1 = coinbase;
-    //     block.header.merkle_root = merkle_root(&block.txns, &block.name_changes);
+        if let Err(Error::BlockValidationError(msg)) = result {
+            assert_eq!(msg, "Block time is less than previous block time")
+        } else {
+            panic!("Expected blocktime error, got {}", result.unwrap_err())
+        }
+    }
 
-    //     while !meets_difficulty(&hash_header(&block.header), &state.difficulty) {
-    //         block.header.nonce += 1;
-    //     }
+    #[test]
+    fn test_pushblock() {
+        let (mut state, mut block, _) = create_dummy_valid_block();
 
-    //     assert!(false);
-    // }
+        push_block(block.clone(), &mut state);
+
+        assert_eq!(state.last_100_block_sizes[99], block_size(&block));
+        assert_eq!(state.last_720_times[719], 821);
+        assert_eq!(state.previous_block_header, block.header);
+    }
 }

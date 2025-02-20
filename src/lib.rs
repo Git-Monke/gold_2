@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::{collections::HashMap, env::consts::OS};
 use thiserror::Error;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Block {
     pub header: Header,
     pub txns: Vec<Txn>,
@@ -26,7 +26,7 @@ pub enum Address {
 
 // In a rename operation, the fee is always paid by the new pk.
 // If a person already owns the name, their pk must be the one that signs this txn. Otherwise, the new pk signs it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RenameOp {
     pub pk: [u8; 32],
     pub sig: [u8; 64],
@@ -34,7 +34,7 @@ pub struct RenameOp {
     pub fee: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Header {
     pub prev_block_hash: [u8; 32],
     pub merkle_root: [u8; 32],
@@ -42,6 +42,7 @@ pub struct Header {
     pub nonce: u64,
 }
 
+#[derive(Debug)]
 pub struct BlockchainState {
     pub account_set: Accounts,
     pub name_set: Names,
@@ -49,7 +50,7 @@ pub struct BlockchainState {
     pub height: usize,
     pub last_720_times: [u64; 720],
     pub last_100_block_sizes: [usize; 100],
-    pub previous_block: Block,
+    pub previous_block_header: Header,
 }
 
 pub struct UndoBlock {
@@ -70,7 +71,7 @@ pub type Names = HashMap<String, [u8; 32]>;
 
 pub const HEADER_SIZE: usize = 80;
 
-pub const TXN_FEES_PER_BYTE: u64 = 400_000;
+pub const TXN_FEES_PER_BYTE: u64 = 2_000_000;
 pub const NAME_CHANGE_FEES_PER_BYTE: u64 = 100_000_000;
 
 pub const DEFAULT_COINBASE: u64 = 200_000_000_000;
@@ -99,7 +100,7 @@ macro_rules! txn_validation_error {
 
 // ! TODO Add difficulty adjustment
 // Takes a validated block and updates the account set
-fn push_block(block: Block, blockchain_state: &mut BlockchainState) -> UndoBlock {
+pub fn push_block(block: Block, blockchain_state: &mut BlockchainState) -> UndoBlock {
     let account_set = &mut blockchain_state.account_set;
     let name_set = &mut blockchain_state.name_set;
 
@@ -145,6 +146,8 @@ fn push_block(block: Block, blockchain_state: &mut BlockchainState) -> UndoBlock
         &mut blockchain_state.last_100_block_sizes,
         block_size(&block),
     );
+
+    blockchain_state.previous_block_header = block.header;
 
     UndoBlock {
         removed_time,
@@ -209,7 +212,7 @@ pub fn validate_block(block: &Block, blockchain_state: &BlockchainState) -> Resu
         block_validation_error!("Header hash does not meet required difficulty");
     }
 
-    if block.header.time < blockchain_state.previous_block.header.time {
+    if block.header.time < blockchain_state.previous_block_header.time {
         block_validation_error!("Block time is less than previous block time");
     }
 
@@ -217,8 +220,7 @@ pub fn validate_block(block: &Block, blockchain_state: &BlockchainState) -> Resu
         block_validation_error!("Header merkle root does not match calculated merkle root");
     }
 
-    if hash(&encode_header(&blockchain_state.previous_block.header)) != block.header.prev_block_hash
-    {
+    if hash_header(&blockchain_state.previous_block_header) != block.header.prev_block_hash {
         block_validation_error!(
             "Header previous block hash does not match calculated hash of previous block"
         )
@@ -334,7 +336,7 @@ pub fn check_txns(
     }
 
     if txn_list[0].recievers[0].1 > coinbase + fees {
-        txn_validation_error!("Coinbase transaction produces more currency than allowed")
+        txn_validation_error!("Coinbase amount is invalid")
     }
 
     Ok(())
