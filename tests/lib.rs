@@ -68,11 +68,12 @@ mod blockchain_validation {
         let (state, keypair) = create_dummy_blockchainstate();
         let prev_block_hash = hash_header(&state.previous_block_header);
 
+        // GitMonke sends 100_000 to all 0's
         let mut example_txn = Txn {
             sender: Address::Name("GitMonke".into()),
             recievers: vec![(Address::Key([0; 32]), 100_000)],
             signature: [0; 64],
-            fee: 10_000,
+            fee: 0,
         };
 
         finalize_txn(&mut example_txn, &keypair);
@@ -93,6 +94,7 @@ mod blockchain_validation {
 
         // inserting the coinbase txn needs refactoring
 
+        // All 0's sends a coinbase txn to GitMonke
         let mut txn = Txn {
             sender: Address::Key([0; 32]),
             recievers: vec![(Address::Name("GitMonke".into()), 0)],
@@ -186,5 +188,18 @@ mod blockchain_validation {
         assert_eq!(state.last_100_block_sizes[99], block_size(&block));
         assert_eq!(state.last_720_times[719], 821);
         assert_eq!(state.previous_block_header, block.header);
+    }
+
+    #[test]
+    fn test_popblock() {
+        let (mut state, mut block, _) = create_dummy_valid_block();
+        let state_before_push = state.clone();
+        let prev_block_size = state.last_100_block_sizes[99];
+        let prev_header = state.previous_block_header.clone();
+
+        let undo_block = push_block(block.clone(), &mut state);
+        pop_block(&undo_block, &mut state);
+
+        assert_eq!(state, state_before_push);
     }
 }

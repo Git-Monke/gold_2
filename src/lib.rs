@@ -42,7 +42,7 @@ pub struct Header {
     pub nonce: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BlockchainState {
     pub account_set: Accounts,
     pub name_set: Names,
@@ -58,6 +58,7 @@ pub struct UndoBlock {
     removed_block_size: usize,
     txns: Vec<Txn>,
     name_changes: Vec<RenameOpUndo>,
+    prev_block_header: Header,
 }
 
 pub struct RenameOpUndo {
@@ -103,6 +104,7 @@ macro_rules! txn_validation_error {
 pub fn push_block(block: Block, blockchain_state: &mut BlockchainState) -> UndoBlock {
     let account_set = &mut blockchain_state.account_set;
     let name_set = &mut blockchain_state.name_set;
+    let prev_block_header = blockchain_state.previous_block_header.clone();
 
     // Any time a name change occurs, the data must be stored in case of an undo. This is later stored in the undo block.
     let mut name_undos = vec![];
@@ -110,14 +112,26 @@ pub fn push_block(block: Block, blockchain_state: &mut BlockchainState) -> UndoB
     // Execute transactions
     for txn in block.txns.iter() {
         let total_spend = txn_total_spend(txn);
+        let sender = address_to_key_unchecked(&txn.sender, name_set);
+        println!("SPENDING: {:?}, {}", txn.sender, total_spend);
 
-        account_set
-            .entry(address_to_key_unchecked(&txn.sender, name_set))
-            .and_modify(|a| *a -= total_spend);
+        // if sender is all 0's, it's a coinbase txn
+        if sender != [0; 32] {
+            account_set
+                .entry(address_to_key_unchecked(&txn.sender, name_set))
+                .and_modify(|a| *a -= total_spend);
+        }
 
         for reciever in txn.recievers.iter() {
+            let account = address_to_key_unchecked(&reciever.0, name_set);
+
+            // If money is sent to an invalid address, it can never be spent. This is considered a burn and is allowed.
+            if XOnlyPublicKey::from_byte_array(&account).is_err() {
+                continue;
+            }
+
             account_set
-                .entry(address_to_key_unchecked(&reciever.0, name_set))
+                .entry(account)
                 .and_modify(|a| *a += reciever.1)
                 .or_insert(reciever.1);
         }
@@ -154,13 +168,14 @@ pub fn push_block(block: Block, blockchain_state: &mut BlockchainState) -> UndoB
         removed_block_size,
         txns: block.txns,
         name_changes: name_undos,
+        prev_block_header,
     }
 }
 
 // ! TODO Add difficulty adjustment
 // Takes the most recently applied block and undoes its transactions
 // In a normal block, name changes are done after txns. So for the undo block, you must reverse the name-changes first.
-fn pop_block(undo_block: &UndoBlock, blockchain_state: &mut BlockchainState) {
+pub fn pop_block(undo_block: &UndoBlock, blockchain_state: &mut BlockchainState) {
     let account_set = &mut blockchain_state.account_set;
     let name_set = &mut blockchain_state.name_set;
 
@@ -181,6 +196,10 @@ fn pop_block(undo_block: &UndoBlock, blockchain_state: &mut BlockchainState) {
             // if the reciever has a balance equal to as much as they were sent in this txn, their balance will be 0 after. Remove from the account set.
             let key = address_to_key_unchecked(&reciever.0, name_set);
 
+            if XOnlyPublicKey::from_byte_array(&key).is_err() {
+                continue;
+            }
+
             if account_set[&key] == reciever.1 {
                 account_set.remove(&key);
             } else {
@@ -198,6 +217,8 @@ fn pop_block(undo_block: &UndoBlock, blockchain_state: &mut BlockchainState) {
         &mut blockchain_state.last_720_times,
         undo_block.removed_time,
     );
+
+    blockchain_state.previous_block_header = undo_block.prev_block_header.clone();
 }
 
 // Takes a block and ensures that it meets all required rules
@@ -573,7 +594,7 @@ pub fn address_to_key(address: &Address, names: &Names) -> Result<[u8; 32], Erro
 }
 
 pub fn push_to_back<T: Copy + Default>(arr: &mut [T], item: T) {
-    for i in 1..arr.len() {
+    for i in 1..(arr.len() - 1) {
         arr[i + 1] = arr[i];
     }
 
